@@ -7,7 +7,9 @@
     "android": {
       "package": "at.ac.hcw.alleabo",
       "permissions": [
-        "android.permission.SCHEDULE_EXACT_ALARM"
+        "android.permission.SCHEDULE_EXACT_ALARM",
+        "android.permission.READ_CALENDAR",
+        "android.permission.WRITE_CALENDAR"
       ]
     },
     "ios": {
@@ -23,6 +25,11 @@
       "expo-notifications",
       "expo-secure-store",
       "expo-sqlite"
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "b76a1805-1b9a-4f46-b052-75ed80737d44"
+      }
+    }
   }
 }
