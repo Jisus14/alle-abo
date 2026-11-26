@@ -1,25 +1,28 @@
 {
   "expo": {
-    "name": "alle-abo",
+    "name": "Alle Abo",
     "slug": "alle-abo",
     "version": "1.0.0",
-    "orientation": "portrait",
-    "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
-    "ios": {
-      "supportsTablet": true
-    },
+    "scheme": "alleabo",
     "android": {
-      "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
-        "foregroundImage": "./assets/android-icon-foreground.png",
-        "backgroundImage": "./assets/android-icon-background.png",
-        "monochromeImage": "./assets/android-icon-monochrome.png"
-      },
-      "predictiveBackGestureEnabled": false
+      "package": "at.ac.hcw.alleabo",
+      "permissions": [
+        "android.permission.SCHEDULE_EXACT_ALARM"
+      ]
     },
-    "web": {
-      "favicon": "./assets/favicon.png"
-    }
+    "ios": {
+      "bundleIdentifier": "at.ac.hcw.alleabo"
+    },
+    "plugins": [
+      [
+        "expo-calendar",
+        {
+          "calendarPermission": "Alle Abo needs calendar access to inject and update subscription deadlines."
+        }
+      ],
+      "expo-notifications",
+      "expo-secure-store",
+      "expo-sqlite"
+    ]
   }
 }
