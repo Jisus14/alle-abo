@@ -1,8 +1,12 @@
 import React, { useEffect, useState } from 'react';
 import {
+  ActivityIndicator,
   Alert,
   FlatList,
+  Modal,
   Platform,
+  ScrollView,
+  Share,
   StyleSheet,
   Switch,
   Text,
@@ -15,23 +19,40 @@ import { StatusBar } from 'expo-status-bar';
 import * as Notifications from 'expo-notifications';
 import * as Calendar from 'expo-calendar';
 import * as SQLite from 'expo-sqlite';
-
-type Cycle = 'weekly' | 'monthly' | 'quarterly' | 'yearly';
-
-interface Subscription {
-  id: number;
-  name: string;
-  price: number;
-  cycle: Cycle;
-  renewalDate: string; // YYYY-MM-DD
-  noticeDays: number;
-  canceled: number; // 0 = active, 1 = canceled
-  notificationId: string | null;
-  calendarEventId: string | null;
-}
+import * as Crypto from 'expo-crypto';
+import { User, onAuthStateChanged } from 'firebase/auth';
+import {
+  Cycle,
+  Subscription,
+  auth,
+  deleteAccountCompletely,
+  deleteCloudSubscription,
+  fetchCloudSubscriptions,
+  loginUser,
+  logoutUser,
+  registerUser,
+  resetPassword,
+  upsertCloudSubscription,
+} from './src/firebase';
+import { PRIVACY_POLICY_TEXT } from './src/privacyPolicy';
 
 const CHANNEL_ID = 'alle-abo-reminders';
 const db = SQLite.openDatabaseSync('alleabo.db');
+
+db.execSync(`
+  CREATE TABLE IF NOT EXISTS subscriptions_v2 (
+    id TEXT PRIMARY KEY NOT NULL,
+    userId TEXT NOT NULL,
+    name TEXT NOT NULL,
+    price REAL NOT NULL,
+    cycle TEXT NOT NULL,
+    renewalDate TEXT NOT NULL,
+    noticeDays INTEGER NOT NULL,
+    canceled INTEGER NOT NULL DEFAULT 0,
+    notificationId TEXT,
+    calendarEventId TEXT
+  );
+`);
 
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
@@ -72,7 +93,158 @@ function daysUntil(date: Date): number {
   return Math.ceil((date.getTime() - Date.now()) / msPerDay);
 }
 
-function AlleAboScreen() {
+function mapFirebaseError(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (msg.includes('auth/invalid-email')) return 'Please enter a valid email address.';
+  if (msg.includes('auth/email-already-in-use')) return 'An account with this email already exists.';
+  if (msg.includes('auth/weak-password')) return 'Password must be at least 6 characters long.';
+  if (msg.includes('auth/invalid-credential') || msg.includes('auth/wrong-password')) {
+    return 'Incorrect email or password.';
+  }
+  if (msg.includes('auth/too-many-requests')) return 'Too many attempts. Try again later.';
+  return msg;
+}
+
+function PrivacyModal({ visible, onClose }: { visible: boolean; onClose: () => void }) {
+  return (
+    <Modal visible={visible} animationType="slide" transparent>
+      <View style={styles.modalBackdrop}>
+        <View style={styles.modalCard}>
+          <Text style={styles.modalTitle}>Privacy Policy (GDPR / DSGVO)</Text>
+          <ScrollView style={styles.modalScroll}>
+            <Text style={styles.policyText}>{PRIVACY_POLICY_TEXT}</Text>
+          </ScrollView>
+          <TouchableOpacity style={styles.primaryBtn} onPress={onClose}>
+            <Text style={styles.primaryBtnText}>Close</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+function AuthScreen({ onOpenPrivacy }: { onOpenPrivacy: () => void }) {
+  const [isRegister, setIsRegister] = useState(false);
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [gdprAccepted, setGdprAccepted] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  async function handleSubmit() {
+    if (!email.trim() || password.length < 6) {
+      Alert.alert('Invalid input', 'Enter a valid email and a password of at least 6 characters.');
+      return;
+    }
+    if (isRegister && !gdprAccepted) {
+      Alert.alert('GDPR Consent Required', 'Please accept the Privacy Policy to create an account.');
+      return;
+    }
+
+    setBusy(true);
+    try {
+      if (isRegister) {
+        await registerUser(email, password);
+      } else {
+        await loginUser(email, password);
+      }
+    } catch (err) {
+      Alert.alert('Authentication Error', mapFirebaseError(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleForgotPassword() {
+    if (!email.trim()) {
+      Alert.alert('Enter Email', 'Type your account email above, then tap Forgot Password.');
+      return;
+    }
+    setBusy(true);
+    try {
+      await resetPassword(email);
+      Alert.alert('Email Sent', `Password reset instructions sent to ${email.trim()}.`);
+    } catch (err) {
+      Alert.alert('Reset Error', mapFirebaseError(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <SafeAreaView style={styles.authContainer} edges={['top', 'left', 'right', 'bottom']}>
+      <StatusBar style="light" />
+      <View style={styles.authBox}>
+        <Text style={styles.title}>Alle Abo</Text>
+        <Text style={styles.subtitle}>
+          {isRegister ? 'Create an EU-hosted account' : 'Sign in to sync your subscriptions'}
+        </Text>
+
+        <TextInput
+          style={styles.input}
+          placeholder="Email address"
+          placeholderTextColor="#888"
+          autoCapitalize="none"
+          keyboardType="email-address"
+          value={email}
+          onChangeText={setEmail}
+        />
+        <TextInput
+          style={styles.input}
+          placeholder="Password (min. 6 characters)"
+          placeholderTextColor="#888"
+          secureTextEntry
+          value={password}
+          onChangeText={setPassword}
+        />
+
+        {isRegister && (
+          <View style={styles.switchRow}>
+            <Text style={[styles.switchLabel, { flex: 1, marginRight: 10 }]}>
+              I consent to data processing as described in the GDPR Privacy Policy.
+            </Text>
+            <Switch value={gdprAccepted} onValueChange={setGdprAccepted} />
+          </View>
+        )}
+
+        <TouchableOpacity
+          style={[styles.addBtn, busy && { opacity: 0.6 }]}
+          onPress={handleSubmit}
+          disabled={busy}
+        >
+          {busy ? (
+            <ActivityIndicator color="#052e16" />
+          ) : (
+            <Text style={styles.addBtnText}>{isRegister ? 'Register' : 'Log In'}</Text>
+          )}
+        </TouchableOpacity>
+
+        {!isRegister && (
+          <TouchableOpacity onPress={handleForgotPassword} disabled={busy}>
+            <Text style={styles.centerLink}>Forgot password?</Text>
+          </TouchableOpacity>
+        )}
+
+        <TouchableOpacity onPress={() => setIsRegister((prev) => !prev)} disabled={busy}>
+          <Text style={styles.centerLink}>
+            {isRegister ? 'Already have an account? Log In' : 'No account yet? Register'}
+          </Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity onPress={onOpenPrivacy} style={styles.privacyFooterBtn}>
+          <Text style={styles.privacyLink}>View Privacy Policy (GDPR / DSGVO)</Text>
+        </TouchableOpacity>
+      </View>
+    </SafeAreaView>
+  );
+}
+
+function DashboardScreen({
+  user,
+  onOpenPrivacy,
+}: {
+  user: User;
+  onOpenPrivacy: () => void;
+}) {
   const [subs, setSubs] = useState<Subscription[]>([]);
   const [name, setName] = useState('');
   const [price, setPrice] = useState('');
@@ -81,29 +253,61 @@ function AlleAboScreen() {
   const [noticeDays, setNoticeDays] = useState('14');
   const [syncCalendar, setSyncCalendar] = useState(true);
 
-  useEffect(() => {
-    db.execSync(`
-      CREATE TABLE IF NOT EXISTS subscriptions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        price REAL NOT NULL,
-        cycle TEXT NOT NULL,
-        renewalDate TEXT NOT NULL,
-        noticeDays INTEGER NOT NULL,
-        canceled INTEGER NOT NULL DEFAULT 0,
-        notificationId TEXT,
-        calendarEventId TEXT
-      );
-    `);
-    loadSubscriptions();
-    setupNotifications();
-  }, []);
+  const [accountModalOpen, setAccountModalOpen] = useState(false);
+  const [deletePassword, setDeletePassword] = useState('');
+  const [deleting, setDeleting] = useState(false);
+  const [syncNote, setSyncNote] = useState<string>('');
 
-  function loadSubscriptions() {
+  useEffect(() => {
+    loadLocalSubscriptions();
+    syncFromCloud();
+    setupNotifications();
+  }, [user.uid]);
+
+  function loadLocalSubscriptions() {
     const rows = db.getAllSync<Subscription>(
-      'SELECT * FROM subscriptions ORDER BY canceled ASC, id DESC;'
+      'SELECT * FROM subscriptions_v2 WHERE userId = ? ORDER BY canceled ASC, name ASC;',
+      [user.uid]
     );
     setSubs(rows);
+  }
+
+  async function syncFromCloud() {
+    try {
+      setSyncNote('Syncing...');
+      const cloudSubs = await fetchCloudSubscriptions(user.uid);
+      const localRows = db.getAllSync<Subscription>(
+        'SELECT * FROM subscriptions_v2 WHERE userId = ?;',
+        [user.uid]
+      );
+      const localMap = new Map(localRows.map((r) => [r.id, r]));
+
+      for (const item of cloudSubs) {
+        const existing = localMap.get(item.id);
+        db.runSync(
+          `INSERT OR REPLACE INTO subscriptions_v2
+           (id, userId, name, price, cycle, renewalDate, noticeDays, canceled, notificationId, calendarEventId)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
+          [
+            item.id,
+            user.uid,
+            item.name,
+            item.price,
+            item.cycle,
+            item.renewalDate,
+            item.noticeDays,
+            item.canceled,
+            existing?.notificationId ?? null,
+            existing?.calendarEventId ?? null,
+          ]
+        );
+      }
+      loadLocalSubscriptions();
+      setSyncNote('Synced (EU Cloud)');
+    } catch {
+      // NFR-05: Stay crash-free offline and keep showing cached SQLite data
+      setSyncNote('Offline Mode (Cached)');
+    }
   }
 
   async function setupNotifications(): Promise<boolean> {
@@ -226,32 +430,72 @@ function AlleAboScreen() {
       calendarEventId = await injectCalendarEvent(name.trim(), deadline, parsedPrice);
     }
 
+    const newSub: Subscription = {
+      id: Crypto.randomUUID(),
+      userId: user.uid,
+      name: name.trim(),
+      price: parsedPrice,
+      cycle,
+      renewalDate,
+      noticeDays: parsedNotice,
+      canceled: 0,
+      notificationId,
+      calendarEventId,
+    };
+
     db.runSync(
-      `INSERT INTO subscriptions (name, price, cycle, renewalDate, noticeDays, canceled, notificationId, calendarEventId)
-       VALUES (?, ?, ?, ?, ?, 0, ?, ?);`,
-      [name.trim(), parsedPrice, cycle, renewalDate, parsedNotice, notificationId, calendarEventId]
+      `INSERT INTO subscriptions_v2
+       (id, userId, name, price, cycle, renewalDate, noticeDays, canceled, notificationId, calendarEventId)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?);`,
+      [
+        newSub.id,
+        newSub.userId,
+        newSub.name,
+        newSub.price,
+        newSub.cycle,
+        newSub.renewalDate,
+        newSub.noticeDays,
+        newSub.notificationId,
+        newSub.calendarEventId,
+      ]
     );
 
     setName('');
     setPrice('');
-    loadSubscriptions();
+    loadLocalSubscriptions();
+
+    try {
+      await upsertCloudSubscription(newSub);
+      setSyncNote('Synced (EU Cloud)');
+    } catch {
+      setSyncNote('Saved Locally (Offline)');
+    }
   }
 
   async function toggleCanceled(sub: Subscription) {
     const nextCanceled = sub.canceled ? 0 : 1;
+    let updatedSub: Subscription = { ...sub, canceled: nextCanceled };
+
     if (nextCanceled === 1) {
       if (sub.notificationId) {
         await Notifications.cancelScheduledNotificationAsync(sub.notificationId);
       }
       await deleteCalendarEvent(sub.calendarEventId);
+      updatedSub = { ...updatedSub, notificationId: null, calendarEventId: null };
       db.runSync(
-        'UPDATE subscriptions SET canceled = 1, notificationId = NULL, calendarEventId = NULL WHERE id = ?;',
+        'UPDATE subscriptions_v2 SET canceled = 1, notificationId = NULL, calendarEventId = NULL WHERE id = ?;',
         [sub.id]
       );
     } else {
-      db.runSync('UPDATE subscriptions SET canceled = 0 WHERE id = ?;', [sub.id]);
+      db.runSync('UPDATE subscriptions_v2 SET canceled = 0 WHERE id = ?;', [sub.id]);
     }
-    loadSubscriptions();
+    loadLocalSubscriptions();
+
+    try {
+      await upsertCloudSubscription(updatedSub);
+    } catch {
+      setSyncNote('Saved Locally (Offline)');
+    }
   }
 
   async function removeSubscription(sub: Subscription) {
@@ -259,8 +503,51 @@ function AlleAboScreen() {
       await Notifications.cancelScheduledNotificationAsync(sub.notificationId);
     }
     await deleteCalendarEvent(sub.calendarEventId);
-    db.runSync('DELETE FROM subscriptions WHERE id = ?;', [sub.id]);
-    loadSubscriptions();
+    db.runSync('DELETE FROM subscriptions_v2 WHERE id = ?;', [sub.id]);
+    loadLocalSubscriptions();
+
+    try {
+      await deleteCloudSubscription(sub.id);
+    } catch {
+      setSyncNote('Deleted Locally (Offline)');
+    }
+  }
+
+  // FR-30 + GDPR Art. 20: Export user data as CSV
+  async function handleExportCsv() {
+    const header = 'Name,Price_EUR,Cycle,RenewalDate,NoticeDays,Status';
+    const lines = subs.map((s) => {
+      const safeName = `"${s.name.replace(/"/g, '""')}"`;
+      const status = s.canceled ? 'Canceled' : 'Active';
+      return `${safeName},${s.price.toFixed(2)},${s.cycle},${s.renewalDate},${s.noticeDays},${status}`;
+    });
+    const csv = [header, ...lines].join('\n');
+    await Share.share({ title: 'alle-abo-export.csv', message: csv });
+  }
+
+  // FR-04 + GDPR Art. 17: Wipe local alerts, calendar events, SQLite, Firestore, and Firebase Auth user
+  async function handleDeleteAccount() {
+    if (deletePassword.length < 6) {
+      Alert.alert('Password Required', 'Enter your current password to confirm permanent deletion.');
+      return;
+    }
+    setDeleting(true);
+    try {
+      for (const s of subs) {
+        if (s.notificationId) {
+          await Notifications.cancelScheduledNotificationAsync(s.notificationId);
+        }
+        await deleteCalendarEvent(s.calendarEventId);
+      }
+      await deleteAccountCompletely(user, deletePassword);
+      db.runSync('DELETE FROM subscriptions_v2 WHERE userId = ?;', [user.uid]);
+      setAccountModalOpen(false);
+      Alert.alert('Account Deleted', 'Your account and all stored data have been permanently erased.');
+    } catch (err) {
+      Alert.alert('Deletion Failed', mapFirebaseError(err));
+    } finally {
+      setDeleting(false);
+    }
   }
 
   const activeSubs = subs.filter((s) => s.canceled === 0);
@@ -272,10 +559,18 @@ function AlleAboScreen() {
       <StatusBar style="light" />
 
       <View style={styles.header}>
-        <Text style={styles.title}>Alle Abo</Text>
-        <TouchableOpacity style={styles.testBtn} onPress={sendTestNotification}>
-          <Text style={styles.testBtnText}>Test Alert (5s)</Text>
-        </TouchableOpacity>
+        <View>
+          <Text style={styles.title}>Alle Abo</Text>
+          <Text style={styles.syncBadge}>{syncNote || user.email}</Text>
+        </View>
+        <View style={styles.headerBtns}>
+          <TouchableOpacity style={styles.testBtn} onPress={sendTestNotification}>
+            <Text style={styles.testBtnText}>Test 5s</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.accountBtn} onPress={() => setAccountModalOpen(true)}>
+            <Text style={styles.testBtnText}>Account</Text>
+          </TouchableOpacity>
+        </View>
       </View>
 
       <View style={styles.summaryRow}>
@@ -350,7 +645,7 @@ function AlleAboScreen() {
 
       <FlatList
         data={subs}
-        keyExtractor={(item) => String(item.id)}
+        keyExtractor={(item) => item.id}
         contentContainerStyle={{ paddingBottom: 32 }}
         ListEmptyComponent={<Text style={styles.empty}>No subscriptions yet.</Text>}
         renderItem={({ item }) => {
@@ -392,23 +687,115 @@ function AlleAboScreen() {
           );
         }}
       />
+
+      {/* Account & GDPR Modal (reachable in 1 tap from main screen) */}
+      <Modal visible={accountModalOpen} animationType="slide" transparent>
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Account & GDPR</Text>
+            <Text style={styles.accountEmail}>{user.email}</Text>
+
+            <TouchableOpacity
+              style={styles.secondaryBtn}
+              onPress={() => {
+                setAccountModalOpen(false);
+                onOpenPrivacy();
+              }}
+            >
+              <Text style={styles.secondaryBtnText}>Privacy Policy (GDPR / DSGVO)</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity style={styles.secondaryBtn} onPress={handleExportCsv}>
+              <Text style={styles.secondaryBtnText}>Export My Data (CSV – Art. 20)</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.secondaryBtn}
+              onPress={async () => {
+                setAccountModalOpen(false);
+                await logoutUser();
+              }}
+            >
+              <Text style={styles.secondaryBtnText}>Log Out</Text>
+            </TouchableOpacity>
+
+            <View style={styles.dangerBox}>
+              <Text style={styles.dangerTitle}>Danger Zone (GDPR Art. 17)</Text>
+              <TextInput
+                style={styles.input}
+                placeholder="Confirm password to delete account"
+                placeholderTextColor="#888"
+                secureTextEntry
+                value={deletePassword}
+                onChangeText={setDeletePassword}
+              />
+              <TouchableOpacity
+                style={[styles.dangerBtn, deleting && { opacity: 0.6 }]}
+                onPress={handleDeleteAccount}
+                disabled={deleting}
+              >
+                <Text style={styles.dangerBtnText}>
+                  {deleting ? 'Deleting...' : 'Delete Account & All Data'}
+                </Text>
+              </TouchableOpacity>
+            </View>
+
+            <TouchableOpacity
+              style={styles.primaryBtn}
+              onPress={() => {
+                setDeletePassword('');
+                setAccountModalOpen(false);
+              }}
+            >
+              <Text style={styles.primaryBtnText}>Close</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
 
 export default function App() {
+  const [user, setUser] = useState<User | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [privacyVisible, setPrivacyVisible] = useState(false);
+
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+      setAuthLoading(false);
+    });
+    return unsubscribe;
+  }, []);
+
   return (
     <SafeAreaProvider>
-      <AlleAboScreen />
+      {authLoading ? (
+        <View style={[styles.authContainer, { alignItems: 'center' }]}>
+          <ActivityIndicator size="large" color="#38bdf8" />
+        </View>
+      ) : user ? (
+        <DashboardScreen user={user} onOpenPrivacy={() => setPrivacyVisible(true)} />
+      ) : (
+        <AuthScreen onOpenPrivacy={() => setPrivacyVisible(true)} />
+      )}
+      <PrivacyModal visible={privacyVisible} onClose={() => setPrivacyVisible(false)} />
     </SafeAreaProvider>
   );
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#0f172a', paddingHorizontal: 16, paddingTop: 12 },
+  authContainer: { flex: 1, backgroundColor: '#0f172a', justifyContent: 'center', padding: 20 },
+  authBox: { backgroundColor: '#1e293b', padding: 20, borderRadius: 14, gap: 12 },
+  subtitle: { color: '#94a3b8', fontSize: 14, marginBottom: 4 },
   header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 },
+  headerBtns: { flexDirection: 'row', gap: 8 },
   title: { fontSize: 26, fontWeight: '700', color: '#f8fafc' },
-  testBtn: { backgroundColor: '#2563eb', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 8 },
+  syncBadge: { color: '#94a3b8', fontSize: 11, marginTop: 2 },
+  testBtn: { backgroundColor: '#2563eb', paddingHorizontal: 10, paddingVertical: 8, borderRadius: 8 },
+  accountBtn: { backgroundColor: '#334155', paddingHorizontal: 10, paddingVertical: 8, borderRadius: 8 },
   testBtnText: { color: '#fff', fontWeight: '600', fontSize: 13 },
   summaryRow: { flexDirection: 'row', gap: 10, marginBottom: 14 },
   summaryBox: { flex: 1, backgroundColor: '#1e293b', padding: 12, borderRadius: 10 },
@@ -426,6 +813,9 @@ const styles = StyleSheet.create({
   switchLabel: { color: '#cbd5e1', fontSize: 13 },
   addBtn: { backgroundColor: '#22c55e', padding: 12, borderRadius: 8, alignItems: 'center' },
   addBtnText: { color: '#052e16', fontWeight: '700', fontSize: 15 },
+  centerLink: { color: '#38bdf8', textAlign: 'center', fontSize: 13, fontWeight: '600', marginTop: 4 },
+  privacyFooterBtn: { marginTop: 8, paddingTop: 10, borderTopWidth: 1, borderTopColor: '#334155' },
+  privacyLink: { color: '#94a3b8', textAlign: 'center', fontSize: 12, textDecorationLine: 'underline' },
   empty: { color: '#64748b', textAlign: 'center', marginTop: 24 },
   card: {
     backgroundColor: '#1e293b',
@@ -443,4 +833,18 @@ const styles = StyleSheet.create({
   cardMeta: { color: '#94a3b8', fontSize: 12, marginBottom: 8 },
   cardActions: { flexDirection: 'row', gap: 18 },
   actionLink: { color: '#60a5fa', fontSize: 13, fontWeight: '600' },
+  modalBackdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.7)', justifyContent: 'center', padding: 18 },
+  modalCard: { backgroundColor: '#1e293b', borderRadius: 14, padding: 18, gap: 10, maxHeight: '85%' },
+  modalTitle: { color: '#f8fafc', fontSize: 20, fontWeight: '700' },
+  modalScroll: { maxHeight: 340 },
+  policyText: { color: '#cbd5e1', fontSize: 13, lineHeight: 20 },
+  accountEmail: { color: '#38bdf8', fontSize: 13, marginBottom: 4 },
+  primaryBtn: { backgroundColor: '#2563eb', padding: 12, borderRadius: 8, alignItems: 'center' },
+  primaryBtnText: { color: '#fff', fontWeight: '700' },
+  secondaryBtn: { backgroundColor: '#334155', padding: 11, borderRadius: 8, alignItems: 'center' },
+  secondaryBtnText: { color: '#f8fafc', fontWeight: '600', fontSize: 14 },
+  dangerBox: { backgroundColor: '#0f172a', padding: 12, borderRadius: 10, gap: 8, borderWidth: 1, borderColor: '#7f1d1d' },
+  dangerTitle: { color: '#f87171', fontWeight: '700', fontSize: 13 },
+  dangerBtn: { backgroundColor: '#dc2626', padding: 11, borderRadius: 8, alignItems: 'center' },
+  dangerBtnText: { color: '#fff', fontWeight: '700', fontSize: 14 },
 });
