@@ -310,6 +310,7 @@ function DashboardScreen({
     }
   }
 
+  const CHANNEL_ID = 'alle-abo-reminders-v2';
   async function setupNotifications(): Promise<boolean> {
     if (Platform.OS === 'android') {
       await Notifications.setNotificationChannelAsync(CHANNEL_ID, {
@@ -333,6 +334,7 @@ function DashboardScreen({
       content: {
         title: 'Alle Abo Reminder',
         body: 'Test alert: Your Netflix cancellation deadline is in 7 days!',
+        sound: 'default',
       },
       trigger: {
         type: Notifications.SchedulableTriggerInputTypes.TIME_INTERVAL,
